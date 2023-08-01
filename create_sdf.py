@@ -1,16 +1,12 @@
 import os
 
-os.environ["PYOPENGL_PLATFORM"] = "egl"
 import sys
 import h5py
 import argparse
 import numpy as np
 import point_cloud_utils as pcu
-import trimesh
 
 import constant
-from mesh_to_sdf.utils import scale_to_unit_sphere
-from mesh_to_sdf import get_surface_point_cloud
 
 
 parser = argparse.ArgumentParser()
@@ -28,14 +24,11 @@ parser.add_argument("--num_procs", type=int, default=1, help="number of processe
 parser.add_argument(
     "--categories",
     type=str,
-    default="bench",
+    default="shapenet_13",
     help="Short-handed categories to generate ground-truth",
 )
 parser.add_argument(
-    "--num_surface_samples", type=int, default=235000, help="Number of surface sampled"
-)
-parser.add_argument(
-    "--num_free_samples", type=int, default=100000, help="Number of surface samples"
+    "--num_surf_pts", type=int, default=125000, help="Number of surface sampled"
 )
 parser.add_argument("--expand_rate", type=float, default=1.1, help="Max value of x,y,z")
 parser.add_argument(
@@ -88,45 +81,50 @@ def create_dataset(args):
                 print(f"{file_name} exists... Skipping")
                 continue
 
+            # Resolution used to convert shapes to watertight manifolds
+            # Higher value means better quality and slower
+            manifold_resolution = 20_000
+
             # Load the mesh
             v, f = pcu.load_mesh_vf(mesh_path)
 
+            # Normalize the vertices to unit sphere
+            v = v - np.mean(v, axis=0)
+            distances = np.linalg.norm(v, axis=1)
+            v /= np.max(distances)
+
             # Convert the mesh to watertight manifold
-            vm, fm = pcu.make_mesh_watertight(v, f, 20000)
+            vm, fm = pcu.make_mesh_watertight(v, f, manifold_resolution)
             nm = pcu.estimate_mesh_vertex_normals(
                 vm, fm
             )  # Compute vertex normals for watertight mesh
 
-            mesh = trimesh.Trimesh(vertices=vm, faces=fm, vertex_normals=nm)
-            mesh = scale_to_unit_sphere(mesh)
+            # Sample points on the surface as face ids and barycentric coordinates
+            fid_surf, bc_surf = pcu.sample_mesh_random(vm, fm, args.num_surf_pts)
 
-            bounding_radius = args.expand_rate
-            ptcld = get_surface_point_cloud(
-                mesh, "scan", bounding_radius=bounding_radius
-            )
-            surface_pts, surface_normals = ptcld.get_random_surface_points(
-                count=args.num_surface_samples
-            )
+            # Compute 3D coordinates and normals of surface samples
+            p_surf = pcu.interpolate_barycentric_coords(fm, fid_surf, bc_surf, vm)
+            n_surf = pcu.interpolate_barycentric_coords(fm, fid_surf, bc_surf, nm)
 
-            free_pts = []
-            free_pts.append(
-                surface_pts
-                + np.random.normal(scale=0.005, size=(args.num_surface_samples, 3))
+            p_free = []
+            p_free.append(
+                p_surf + np.random.normal(scale=0.005, size=(args.num_surf_pts, 3))
             )
-            free_pts.append(
-                surface_pts
-                + np.random.normal(scale=0.0005, size=(args.num_surface_samples, 3))
+            p_free.append(
+                p_surf + np.random.normal(scale=0.0005, size=(args.num_surf_pts, 3))
             )
-            free_pts.append(
+            p_free.append(
                 np.random.uniform(
-                    -args.expand_rate, args.expand_rate, (args.num_free_samples, 3)
+                    -args.expand_rate, args.expand_rate, (args.num_surf_pts, 3)
                 )
             )
-            free_pts = np.concatenate(free_pts)
-            free_points_sdf = ptcld.get_sdf_in_batches(free_pts, use_depth_buffer=False)
+            p_free = np.concatenate(p_free)
 
-            surface_data = np.concatenate([surface_pts, surface_normals], axis=-1)
-            free_data = np.concatenate([free_pts, free_points_sdf[:, None]], axis=-1)
+            # Comput the SDF of the random points
+            sdf, _, _ = pcu.signed_distance_to_mesh(p_free, vm, fm)
+
+            surface_data = np.concatenate([p_surf, n_surf], axis=-1)
+            free_data = np.concatenate([p_free, sdf[:, None]], axis=-1)
 
             f1 = h5py.File(h5_file, "w")
             f1.create_dataset(
